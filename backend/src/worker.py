@@ -6,6 +6,7 @@ from src.config.database import Session
 from src.config.settings import REDIS_URL
 from src.models.entities import Drill
 from src.services.election import elect
+from src.services.apply_service import recover_worker_once
 redis = Redis.from_url(REDIS_URL)
 logging.basicConfig(level=logging.INFO)
 # Redis leadership lock ensures only one worker processes the durable DB queue.
@@ -26,6 +27,9 @@ while True:
                         job.status = 'failed'
                     db.commit()
                     logging.info('drill %s %s', job.id, job.status)
+            # 落实中断恢复：租约过期的 pending/applying 记录由 worker 重跑原操作。
+            for item in recover_worker_once():
+                logging.info('apply drill %s recovered -> %s', item['drill_id'], item['status'])
     except Exception:
         logging.exception('worker retry')
     time.sleep(1)

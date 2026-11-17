@@ -2,7 +2,7 @@
 衡石数据值班组（10人）把节点巡检、故障剧本与切主证明合并为可复核演练记录。
 
 ## 业务与模块
-原流程用值班表记录节点、聊天传递故障、人工比较日志。痛点：输入版本混乱、隔离证明缺失、决策无法复查。上游是巡检记录；本工具替代人工纸上演练；下游是复核人和运维值班负责人。模块为节点状态、故障剧本、演练队列、决策证据，配套登录及JSON导出。三个实体 Node / Scenario / Drill 全链路实现。
+原流程用值班表记录节点、聊天传递故障、人工比较日志。痛点：输入版本混乱、隔离证明缺失、决策无法复查。上游是巡检记录；本工具替代人工纸上演练；下游是复核人和运维值班负责人。模块为节点状态、故障剧本、演练队列、决策证据、结论落实，配套登录及JSON导出。三个业务实体 Node / Scenario / Drill 与落实凭据 DrillApply 全链路实现。
 
 **边界：受控教学/运维演练计算模型，不连接真实复制集群、不执行真实生产选主；任期、日志位置和fencing均由用户输入声明。** 本题真实 MySQL 保存业务输入/快照/结果，Python 实际计算规则，后台 worker 异步处理。
 
@@ -24,10 +24,23 @@ docker compose down --remove-orphans
 |viewer@hengshi.local|Drill2026!|只读/导出|核对规则及结果|
 
 ## 一天剧本
-09:00操作员登录；09:05核对hs-primary日志8100、hs-east日志8100、hs-west日志8098，任期均6；09:10创建shift-20261117剧本，允许损失0、新任期门槛7、主故障且已隔离；09:20提交晚班演练；09:25查看候选hs-east、新任期7、多数派2/2；09:30导出JSON；09:35运行“缺少隔离证明”案例，应阻断；09:40观察员复核但新增返回403；10:00管理员查看 /api/audits。
+09:00操作员登录；09:05核对hs-primary日志8100、hs-east日志8100、hs-west日志8098，任期均6；09:10创建shift-20261117剧本，允许损失0、新任期门槛7、主故障且已隔离；09:20提交晚班演练；09:25查看候选hs-east、新任期7、多数派2/2；09:30导出JSON；09:35运行“缺少隔离证明”案例，应阻断；09:40观察员复核但新增返回403；09:50在“结论落实”页对已允许切主的演练发起落实，原主降级并隔离、hs-east成为主且任期7，凭据与前后节点一并保存；10:00管理员查看 /api/audits。
 
 ## 算法口径
 输入为入队时冻结的节点与剧本快照。法定票数 floor(配置投票节点数/2)+1；可达票扣除不可达/已隔离/本次故障主节点；候选必须可达、有投票权、非主、未隔离且落后量不超过允许日志损失。新任期=max(节点任期)+1。所有安全条件成立时按日志位置降序、节点名升序确定候选；缺少旧主fencing、票数不足、未触发故障、任期不足或无合格候选均阻断。空节点、零投票节点、多个主节点计算失败并保存原因。结果含输入SHA256与模型版本，可重复计算。不会伪造真实集群共识证据。
+
+## 结论落实
+演练给出“允许切主”后，操作员或管理员可在“结论落实”页或决策证据页发起落实。落实不是第二套选主算法，而是把已有结论落回沙盘节点：
+
+- **原子切换**：在一个行锁事务内校验并写入；原主置为 follower 且 `fenced=true`，新主置为 leader 并取结论任期，同时落定落实凭据（`DrillApply.credential`）。节点切换与凭据同一次提交，写入后断电只回滚，不会留下半切换状态。
+- **先复核再落实**：按当前节点重算冻结剧本。若原证据已不安全（候选失联/被隔离/失去投票权、票数不足、出现双主、最优候选或任期改变），则拒绝并逐条说明原因与相对快照的字段变化；原演练结论与输入摘要保持不变。
+- **并发**：不同演练同时落实时，节点行锁把比较与写入串行化，后到者看到新主后拒绝，不会产生双主；条件更新与写后自检再兜底，任期永不倒退，也不会被改小。
+- **同次重试**：同一演练只有一条落实记录（`drill_id` 唯一），重复点击返回既有凭据，`attempts` 不增加，任期不会再升一级。
+- **中断恢复**：发起时先提交领取凭据（`applying` + 租约），再由 worker 或管理员接口接管过期租约重跑原操作；旧执行者晚到时会发现自己已不是领取人，直接返回当前结果，不覆盖新主。
+- **后续演练**：入队快照读取当前节点，因此落实后的下一次演练以新主、新任期和原主隔离状态为输入。
+- **权限**：观察员只能查看待处理、已落实、已拒绝记录及前后节点，发起落实返回 403。
+
+接口：`GET /api/applies`、`GET /api/drills/{id}/apply`、`POST /api/drills/{id}/apply`、`POST /api/applies/recover`（管理员）。拒绝与并发冲突均返回 409 并带 `problems`；执行中返回 202。
 
 ## 工程
 |组件|技术|
@@ -36,10 +49,10 @@ docker compose down --remove-orphans
 |后端|Python3.11/FastAPI/SQLAlchemy/PyJWT|
 |任务|MySQL持久队列 + Redis worker互斥锁 + 心跳|
 |存储|MySQL8.0、Redis7|
-所有计算和权限检查在后端。JWT有效8小时，密码PBKDF2-SHA256 180000轮随机盐。20条待处理任务配额。审计保存业务写入动作；错误返回request-id。五服务均真实健康检查。
+所有计算和权限检查在后端。JWT有效8小时，密码PBKDF2-SHA256 180000轮随机盐。20条待处理任务配额。落实情况由 worker 每秒巡检过期租约。审计保存业务写入动作（含落实与拒绝）；错误返回request-id。五服务均真实健康检查。
 
-目录：frontend/src/api、stores、types、components/common、hooks、pages、router、utils、constants；backend/src/routes、controllers、services、models、schemas、middlewares、utils、constants、config；backend/scripts；backend/migrations。本地开发：安装backend/requirements.txt并设DATABASE_URL、REDIS_URL、JWT_SECRET，再运行uvicorn；前端以Nginx代理/api/去除前缀。
+目录：frontend/src/api、stores、types、components/common、hooks、pages、router、utils、constants；backend/src/routes、controllers、services、models、schemas、middlewares、utils、constants、config；backend/scripts；backend/tests；backend/migrations。本地开发：安装backend/requirements.txt并设DATABASE_URL、REDIS_URL、JWT_SECRET，再运行uvicorn；前端以Nginx代理/api/去除前缀。
 
 环境：COMPOSE_PROJECT_NAME控制隔离命名；FRONTEND_PORT/BACKEND_PORT/DB_PORT为端口；DB_PASSWORD为演示数据库密码；JWT_SECRET为签名密钥；SEED_DEMO=false关闭演示数据。命名卷db-data、redis-data、artifacts；reset时显式down -v删除数据。前端字体依赖Google Fonts，离线回退serif/sans-serif。模型是简化安全门禁，非完整Raft实现。MIT许可。
 
-枚举：角色在backend/src/constants/enums.py和frontend/src/constants/enums.js；任务状态同处定义，使用于models/entities.py、services/drill_service.py、worker.py、components/common/status.js；节点角色在schemas/node.py、pages/nodes.js。测试、截图与已知差异见批次test-artifacts/gb-4110/TESTING.md。
+枚举：角色在backend/src/constants/enums.py和frontend/src/constants/enums.js；任务状态与落实状态同处定义，使用于models/entities.py、services/drill_service.py、services/apply_service.py、worker.py、components/common/status.js、components/common/apply.js；节点角色在schemas/node.py、pages/nodes.js。落实规则位于services/apply_guard.py（纯函数）与services/apply_service.py（事务）；测试见backend/tests/test_apply.py（`cd backend && pip install -r requirements-dev.txt && python3 -m pytest -q`，开发依赖仅 pytest/httpx）。测试、截图与已知差异见批次test-artifacts/gb-4110/TESTING.md。

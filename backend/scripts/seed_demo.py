@@ -2,6 +2,7 @@ import os
 from sqlalchemy import select
 from src.config.database import Base, engine, Session
 from src.models.entities import User, Node, Scenario
+from src.models.entities import Drill, DrillApply, Audit  # noqa: F401  确保落实表在首启时建表
 from src.utils.security import hash_password
 
 def seed():
